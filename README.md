@@ -11,8 +11,13 @@ No Blender, MeshLab, or other dependencies to install. Just download the app.
 1. Download the latest `Print-Doctor-macOS-arm64.zip` from the [Releases page](../../releases).
    Requires an Apple Silicon Mac (M1/M2/M3/M4). Intel Macs are not supported.
 2. Unzip and drag `Print Doctor.app` into your Applications folder.
-3. **First launch:** right-click the app → **Open** → **Open** in the dialog.
-   (Double-clicking shows "unidentified developer" — this is macOS's warning for apps not signed with a paid Apple Developer ID. Right-click → Open bypasses it. You only need to do this once.)
+3. **First launch.** Double-clicking will show a Gatekeeper dialog (*"Apple could not verify Print Doctor is free of malware..."*) with only **Move to Trash** / **Done** buttons. This is normal for apps not signed with a paid Apple Developer ID. To bypass:
+   - Click **Done** on the dialog.
+   - Open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the *"Print Doctor was blocked..."* message.
+   - Authenticate when prompted, then re-launch the app and click **Open** in the new confirmation dialog.
+   - You only need to do this once per install.
+
+   *(On macOS 14 Sonoma and earlier, right-clicking the app → **Open** → **Open** is a faster bypass. Sequoia removed that shortcut.)*
 
 ## Use
 
