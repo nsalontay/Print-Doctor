@@ -8,9 +8,8 @@ No Blender, MeshLab, or other dependencies to install. Just download the app.
 
 ## Install (macOS)
 
-1. Download the latest `Print-Doctor-macOS-*.zip` from the [Releases page](../../releases).
-   - Apple Silicon Macs (M1/M2/M3/M4): pick the `arm64` zip
-   - Intel Macs: pick the `x86_64` zip
+1. Download the latest `Print-Doctor-macOS-arm64.zip` from the [Releases page](../../releases).
+   Requires an Apple Silicon Mac (M1/M2/M3/M4). Intel Macs are not supported.
 2. Unzip and drag `Print Doctor.app` into your Applications folder.
 3. **First launch:** right-click the app → **Open** → **Open** in the dialog.
    (Double-clicking shows "unidentified developer" — this is macOS's warning for apps not signed with a paid Apple Developer ID. Right-click → Open bypasses it. You only need to do this once.)
