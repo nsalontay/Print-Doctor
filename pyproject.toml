@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "print-doctor"
+version = "0.1.0"
+description = "Print Doctor — drag-and-drop batch repair for non-manifold meshes (STL, OBJ, PLY, 3MF)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Niklos Salontay" }]
+dependencies = [
+    "PySide6>=6.6",
+    "trimesh>=4.0",
+    "pymeshfix>=0.17",
+    "numpy>=1.24",
+    # trimesh soft-deps we rely on:
+    "networkx>=3.0",     # fix_winding / fix_normals
+    "scipy>=1.10",       # voxelized() / spatial queries
+    "manifold3d>=2.5",   # robust boolean ops used by some trimesh fallbacks
+    "scikit-image>=0.22", # marching_cubes for voxel remesh
+    "lxml>=4.9",         # trimesh 3MF loader/exporter
+]
+
+[project.scripts]
+print-doctor = "stl_repair.app:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
