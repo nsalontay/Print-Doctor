@@ -77,6 +77,54 @@ def _basic_clean(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return mesh
 
 
+def _drop_sliver_components(mesh: trimesh.Trimesh,
+                            min_face_ratio: float = 0.01,
+                            min_faces_floor: int = 20) -> Optional[trimesh.Trimesh]:
+    """Remove tiny disconnected components before MeshFix.
+
+    CAD boolean exports frequently contain hundreds of 1-3 face slivers along
+    symmetry planes. With that much noise, MeshFix's `join_closest_components`
+    pairs the real halves to slivers instead of to each other, and the
+    subsequent `clean()` drops half the model. Filtering these out first
+    exposes the real components to the join step.
+
+    Keeps any component with at least `max(min_faces_floor,
+    min_face_ratio * largest_component.face_count)` faces.
+    """
+    parts = mesh.split(only_watertight=False)
+    if len(parts) <= 1:
+        return mesh
+    max_faces = max(len(p.faces) for p in parts)
+    threshold = max(min_faces_floor, int(max_faces * min_face_ratio))
+    # Never drop the largest component, and don't filter at all if every
+    # component is below the threshold (they're all peers, not slivers).
+    if threshold >= max_faces:
+        return mesh
+    kept = [p for p in parts if len(p.faces) >= threshold]
+    if len(kept) == len(parts):
+        return mesh
+    log.info("Dropped %d sliver component(s), kept %d (face threshold: %d)",
+             len(parts) - len(kept), len(kept), threshold)
+    return trimesh.util.concatenate(kept)
+
+
+def _bounds_comparable(src: trimesh.Trimesh, dst: trimesh.Trimesh,
+                       min_ratio: float = 0.8) -> bool:
+    """True if `dst`'s bounding box matches `src`'s on every axis within
+    `min_ratio`. Repair ops fill/weld; they shouldn't shrink bounds. A >20%
+    shrink on any axis almost always means geometry was silently dropped
+    (e.g. MeshFix removing the "wrong" component)."""
+    for a, b in zip(src.extents, dst.extents):
+        if a <= 0:
+            continue
+        if b / a < min_ratio:
+            log.warning("MeshFix output shrank from %.2f to %.2f on one axis "
+                        "(ratio %.2f < %.2f); treating as failure",
+                        a, b, b / a, min_ratio)
+            return False
+    return True
+
+
 def _apply_meshfix(mesh: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
     """Run MeshFix — robust hole-filling + non-manifold repair.
 
@@ -84,12 +132,19 @@ def _apply_meshfix(mesh: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
     high-level wrapper). Replicates the steps pymeshfix.MeshFix.repair() does:
     join closest components, remove intersections, remove smallest components,
     fill small boundaries.
+
+    Rejects the result if the output bounding box is substantially smaller
+    than the input — that's the fingerprint of `clean()` dropping real
+    geometry alongside slivers it couldn't weld.
     """
+    filtered = _drop_sliver_components(mesh)
+    if filtered is None:
+        return None
     try:
         tin = PyTMesh()
         tin.set_quiet(True)
-        tin.load_array(np.ascontiguousarray(mesh.vertices, dtype=np.float64),
-                       np.ascontiguousarray(mesh.faces, dtype=np.int32))
+        tin.load_array(np.ascontiguousarray(filtered.vertices, dtype=np.float64),
+                       np.ascontiguousarray(filtered.faces, dtype=np.int32))
         tin.join_closest_components()
         tin.fill_small_boundaries(nbe=0)  # 0 = fill all
         tin.clean(max_iters=10, inner_loops=3)
@@ -104,6 +159,8 @@ def _apply_meshfix(mesh: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
                 trimesh.repair.fix_inversion(out)
             except Exception:
                 pass
+        if not _bounds_comparable(filtered, out):
+            return None
         return out
     except Exception as e:
         log.warning("MeshFix failed: %s", e)
