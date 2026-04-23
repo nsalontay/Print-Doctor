@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -1627,6 +1629,19 @@ class MainWindow(QMainWindow):
         self.worker: Optional[RepairWorker] = None
         self._done = False
 
+        # ETA state — updated during a batch so the progress label decrements
+        # every second rather than only on file-boundary events.
+        self._batch_t0 = 0.0
+        self._files_completed = 0
+        self._last_finish_t = 0.0
+        self._current_file_name = ""
+        self._current_file_idx = 0
+        self._current_total = 0
+        self._current_phase: Optional[str] = None
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._tick_eta)
+
         central = QWidget()
         central.setObjectName("rootBg")
         central.setAttribute(Qt.WA_StyledBackground, True)
@@ -1907,6 +1922,14 @@ class MainWindow(QMainWindow):
         self._rail.set_progress(0, len(self.files))
         self._progress_pct.setText("0%")
         self._progress_label.setText(f"[0/{len(self.files)}] starting…")
+        self._batch_t0 = time.monotonic()
+        self._last_finish_t = self._batch_t0
+        self._files_completed = 0
+        self._current_file_name = ""
+        self._current_file_idx = 0
+        self._current_total = len(self.files)
+        self._current_phase = None
+        self._eta_timer.start()
         self.source.set_running(True)
         self.advanced.set_running(True)
         self.dest.set_enabled_state(False)
@@ -1941,7 +1964,11 @@ class MainWindow(QMainWindow):
         path = self._path_for_name(name)
         if path:
             self.file_list.set_status(path, STATUS_RUNNING, "working…")
-        self._progress_label.setText(f"[{i}/{total}] {name}")
+        self._current_file_name = name
+        self._current_file_idx = i
+        self._current_total = total
+        self._current_phase = None
+        self._render_progress_label()
         pct = int(100 * (i - 1) / max(1, total))
         self._progress_pct.setText(f"{pct}%")
         self._rail.set_progress(i - 1, total)
@@ -1951,6 +1978,11 @@ class MainWindow(QMainWindow):
         if path:
             label = PHASE_LABELS.get(phase, phase)
             self.file_list.set_status(path, STATUS_RUNNING, label)
+        self._current_file_idx = i
+        self._current_total = total
+        self._current_file_name = name
+        self._current_phase = phase
+        self._render_progress_label()
 
     def _on_file_finished(self, result) -> None:
         name = os.path.basename(result.input_path)
@@ -1966,13 +1998,63 @@ class MainWindow(QMainWindow):
             phase_label = "failed"
         self.file_list.set_status(path, status, phase_label)
 
+        self._files_completed += 1
+        self._last_finish_t = time.monotonic()
+
         # Bump progress rail.
         done = self._rail._value + 1
         self._rail.set_progress(done, len(self.files))
         pct = int(100 * done / max(1, len(self.files)))
         self._progress_pct.setText(f"{pct}%")
+        self._render_progress_label()
+
+    def _tick_eta(self) -> None:
+        """QTimer slot — re-renders the progress label every second so the ETA
+        decrements within a long-running file."""
+        if self._current_total > 0:
+            self._render_progress_label()
+
+    def _render_progress_label(self) -> None:
+        """Render `[i/total] name — phase — ~Xm left` from current state."""
+        if self._current_total <= 0:
+            return
+        parts = [f"[{self._current_file_idx}/{self._current_total}] "
+                 f"{self._current_file_name}"]
+        if self._current_phase:
+            parts.append(PHASE_LABELS.get(self._current_phase, self._current_phase))
+        eta = self._format_eta()
+        if eta:
+            parts.append(eta)
+        self._progress_label.setText(" — ".join(parts))
+
+    def _format_eta(self) -> str:
+        """ETA = estimated remaining for the current file + avg × files after it.
+
+        `avg` is mean wall-clock per completed file. The in-progress file is
+        modeled as `max(0, avg - time_on_current)`, so the ETA ticks down
+        every second as `time_on_current` grows. If the current file runs
+        longer than average, its contribution floors at 0 (the total ETA can
+        still underestimate, but at least it stops growing)."""
+        if self._files_completed == 0 or self._current_total <= 0:
+            return ""
+        avg = (self._last_finish_t - self._batch_t0) / self._files_completed
+        time_on_current = time.monotonic() - self._last_finish_t
+        est_current = max(0.0, avg - time_on_current)
+        remaining_after_current = max(0, self._current_total
+                                      - self._files_completed - 1)
+        secs = int(est_current + avg * remaining_after_current)
+        if secs < 60:
+            return f"~{secs}s left"
+        mins = secs // 60
+        if mins < 60:
+            return f"~{mins}m left"
+        hours = mins // 60
+        return f"~{hours}h{mins % 60:02d}m left"
 
     def _on_batch_finished(self, success: int, total: int, failed: list) -> None:
+        self._eta_timer.stop()
+        self._current_total = 0
+
         # Count partials (coarse-remesh with residual errors).
         done_ct = 0
         warn_ct = 0
@@ -1998,6 +2080,8 @@ class MainWindow(QMainWindow):
         self._update_primary_button()
 
     def _on_batch_error(self, msg: str) -> None:
+        self._eta_timer.stop()
+        self._current_total = 0
         self._progress_row.setVisible(False)
         self.source.set_running(False)
         self.advanced.set_running(False)
@@ -2034,6 +2118,11 @@ def _check_dependencies() -> list[str]:
 
 
 def main() -> int:
+    # Must run before any multiprocessing.Process is created. In a PyInstaller
+    # bundle the child re-executes sys.executable with special args; this
+    # short-circuits that path so the child runs its target instead of
+    # re-launching the GUI.
+    multiprocessing.freeze_support()
     _setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

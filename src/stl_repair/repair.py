@@ -182,8 +182,14 @@ def _apply_meshfix(mesh: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
         return None
 
 
-def _voxel_remesh(mesh: trimesh.Trimesh, divider: int) -> Optional[trimesh.Trimesh]:
-    """Voxelize → fill → marching cubes. Pitch = max_dim / divider.
+def _voxel_remesh(mesh: trimesh.Trimesh, divider: int,
+                  voxel_budget: int,
+                  sub_phase: Optional[Callable[[str], None]] = None,
+                  ) -> Optional[trimesh.Trimesh]:
+    """Voxelize → fill → marching cubes. Pitch is the **coarser** of
+    (max_dim / divider) and (volume / voxel_budget)^(1/3); capping by volume
+    keeps elongated meshes from blowing up along the long axis (a 27×95×76 mm
+    wall at divider=350 would otherwise build a ~10M-voxel grid).
 
     trimesh's `VoxelGrid.marching_cubes` returns vertices in voxel-INDEX space
     (0..N) rather than world coordinates — we apply the grid's transform
@@ -191,16 +197,36 @@ def _voxel_remesh(mesh: trimesh.Trimesh, divider: int) -> Optional[trimesh.Trime
     the input. Otherwise downstream slicers see meshes ~`divider/max_dim`×
     larger than expected.
     """
+    def sub(name: str) -> None:
+        if sub_phase is not None:
+            try:
+                sub_phase(name)
+            except Exception:
+                pass
+
     try:
-        max_dim = float(np.max(mesh.extents))
+        extents = mesh.extents
+        max_dim = float(np.max(extents))
         if max_dim == 0 or not np.isfinite(max_dim):
             return None
-        pitch = max_dim / divider
-        vox = mesh.voxelized(pitch=pitch).fill()
+        volume = float(np.prod(extents))
+        pitch_from_divider = max_dim / divider
+        pitch_from_budget = (volume / voxel_budget) ** (1.0 / 3.0) if volume > 0 else pitch_from_divider
+        pitch = max(pitch_from_divider, pitch_from_budget)
+        est_voxels = int(volume / (pitch ** 3)) if pitch > 0 else 0
+        log.info("  Voxel grid: pitch=%.4f (from divider=%.4f, from budget=%.4f), "
+                 "~%d voxels", pitch, pitch_from_divider, pitch_from_budget, est_voxels)
+
+        sub("voxelizing")
+        vox = mesh.voxelized(pitch=pitch)
+        sub("filling interior")
+        vox = vox.fill()
+        sub("marching cubes")
         remeshed = vox.marching_cubes
         if remeshed is None or len(remeshed.faces) == 0:
             return None
         remeshed.apply_transform(vox.transform)
+        sub("cleanup")
         _basic_clean(remeshed)
         return remeshed
     except Exception as e:
@@ -325,8 +351,13 @@ def repair_mesh(input_path: str,
         # Phase 3 — fine voxel remesh
         phase("fine voxel remesh")
         source = fixed if fixed is not None else mesh
+
+        def _fine_sub(name: str) -> None:
+            phase(f"fine voxel: {name}")
+
         t0 = time.monotonic()
-        remeshed = _voxel_remesh(source, divider=350)
+        remeshed = _voxel_remesh(source, divider=350, voxel_budget=3_000_000,
+                                 sub_phase=_fine_sub)
         log.info("  Phase 3 (fine voxel) %.2fs", time.monotonic() - t0)
         if remeshed is not None and _is_clean(remeshed):
             _export(remeshed, output_path, inverse_scale)
@@ -336,8 +367,13 @@ def repair_mesh(input_path: str,
 
         # Phase 4 — coarse voxel remesh (best-effort; export even if imperfect)
         phase("coarse voxel remesh")
+
+        def _coarse_sub(name: str) -> None:
+            phase(f"coarse voxel: {name}")
+
         t0 = time.monotonic()
-        remeshed = _voxel_remesh(source, divider=150)
+        remeshed = _voxel_remesh(source, divider=150, voxel_budget=500_000,
+                                 sub_phase=_coarse_sub)
         log.info("  Phase 4 (coarse voxel) %.2fs", time.monotonic() - t0)
         if remeshed is not None:
             _export(remeshed, output_path, inverse_scale)
