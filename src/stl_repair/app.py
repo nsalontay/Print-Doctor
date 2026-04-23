@@ -1629,15 +1629,14 @@ class MainWindow(QMainWindow):
         self.worker: Optional[RepairWorker] = None
         self._done = False
 
-        # ETA state — updated during a batch so the progress label decrements
-        # every second rather than only on file-boundary events.
+        # Batch progress state — updated during a run so the aggregate label
+        # (done · running · queued — ETA) ticks every second rather than only
+        # on file-boundary events.
         self._batch_t0 = 0.0
+        self._batch_total = 0
         self._files_completed = 0
         self._last_finish_t = 0.0
-        self._current_file_name = ""
-        self._current_file_idx = 0
-        self._current_total = 0
-        self._current_phase: Optional[str] = None
+        self._in_flight: set[str] = set()
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
         self._eta_timer.timeout.connect(self._tick_eta)
@@ -1921,14 +1920,12 @@ class MainWindow(QMainWindow):
         self._progress_row.setVisible(True)
         self._rail.set_progress(0, len(self.files))
         self._progress_pct.setText("0%")
-        self._progress_label.setText(f"[0/{len(self.files)}] starting…")
+        self._progress_label.setText(f"0 done · 0 running · {len(self.files)} queued — starting…")
         self._batch_t0 = time.monotonic()
         self._last_finish_t = self._batch_t0
         self._files_completed = 0
-        self._current_file_name = ""
-        self._current_file_idx = 0
-        self._current_total = len(self.files)
-        self._current_phase = None
+        self._batch_total = len(self.files)
+        self._in_flight.clear()
         self._eta_timer.start()
         self.source.set_running(True)
         self.advanced.set_running(True)
@@ -1964,25 +1961,17 @@ class MainWindow(QMainWindow):
         path = self._path_for_name(name)
         if path:
             self.file_list.set_status(path, STATUS_RUNNING, "working…")
-        self._current_file_name = name
-        self._current_file_idx = i
-        self._current_total = total
-        self._current_phase = None
+        self._in_flight.add(name)
         self._render_progress_label()
-        pct = int(100 * (i - 1) / max(1, total))
-        self._progress_pct.setText(f"{pct}%")
-        self._rail.set_progress(i - 1, total)
 
     def _on_file_phase(self, i: int, total: int, name: str, phase: str) -> None:
+        """Per-file phase update — only the file_list row changes. The top-of-
+        window aggregate label intentionally does not reflect per-file phase
+        because multiple files run concurrently."""
         path = self._path_for_name(name)
         if path:
             label = PHASE_LABELS.get(phase, phase)
             self.file_list.set_status(path, STATUS_RUNNING, label)
-        self._current_file_idx = i
-        self._current_total = total
-        self._current_file_name = name
-        self._current_phase = phase
-        self._render_progress_label()
 
     def _on_file_finished(self, result) -> None:
         name = os.path.basename(result.input_path)
@@ -1998,6 +1987,7 @@ class MainWindow(QMainWindow):
             phase_label = "failed"
         self.file_list.set_status(path, status, phase_label)
 
+        self._in_flight.discard(name)
         self._files_completed += 1
         self._last_finish_t = time.monotonic()
 
@@ -2010,39 +2000,40 @@ class MainWindow(QMainWindow):
 
     def _tick_eta(self) -> None:
         """QTimer slot — re-renders the progress label every second so the ETA
-        decrements within a long-running file."""
-        if self._current_total > 0:
+        decrements even when no file has finished this second."""
+        if self._batch_total > 0:
             self._render_progress_label()
 
     def _render_progress_label(self) -> None:
-        """Render `[i/total] name — phase — ~Xm left` from current state."""
-        if self._current_total <= 0:
+        """Render `N done · M running · K queued — ~Xm left`. Aggregate form
+        is used because with N workers in parallel there's no single 'current'
+        file to highlight — per-file phase remains visible in the file list."""
+        if self._batch_total <= 0:
             return
-        parts = [f"[{self._current_file_idx}/{self._current_total}] "
-                 f"{self._current_file_name}"]
-        if self._current_phase:
-            parts.append(PHASE_LABELS.get(self._current_phase, self._current_phase))
+        running = len(self._in_flight)
+        done = self._files_completed
+        queued = max(0, self._batch_total - done - running)
+        parts = [f"{done} done · {running} running · {queued} queued"]
         eta = self._format_eta()
         if eta:
             parts.append(eta)
         self._progress_label.setText(" — ".join(parts))
 
     def _format_eta(self) -> str:
-        """ETA = estimated remaining for the current file + avg × files after it.
+        """ETA = max(0, avg − time_since_last_finish) + avg × (remaining − 1).
 
-        `avg` is mean wall-clock per completed file. The in-progress file is
-        modeled as `max(0, avg - time_on_current)`, so the ETA ticks down
-        every second as `time_on_current` grows. If the current file runs
-        longer than average, its contribution floors at 0 (the total ETA can
-        still underestimate, but at least it stops growing)."""
-        if self._files_completed == 0 or self._current_total <= 0:
+        `avg` = mean wall-clock seconds between completions (already amortized
+        across the N parallel workers, since every finish increments
+        `_files_completed`). The first term models the next completion about
+        to land; as time elapses without one, it shrinks and the ETA ticks
+        down. Floored at 0 so the ETA never grows past the last refresh."""
+        if self._files_completed == 0 or self._batch_total <= 0:
             return ""
         avg = (self._last_finish_t - self._batch_t0) / self._files_completed
-        time_on_current = time.monotonic() - self._last_finish_t
-        est_current = max(0.0, avg - time_on_current)
-        remaining_after_current = max(0, self._current_total
-                                      - self._files_completed - 1)
-        secs = int(est_current + avg * remaining_after_current)
+        time_since_last = time.monotonic() - self._last_finish_t
+        est_next = max(0.0, avg - time_since_last)
+        remaining_after_next = max(0, self._batch_total - self._files_completed - 1)
+        secs = int(est_next + avg * remaining_after_next)
         if secs < 60:
             return f"~{secs}s left"
         mins = secs // 60
@@ -2053,7 +2044,8 @@ class MainWindow(QMainWindow):
 
     def _on_batch_finished(self, success: int, total: int, failed: list) -> None:
         self._eta_timer.stop()
-        self._current_total = 0
+        self._batch_total = 0
+        self._in_flight.clear()
 
         # Count partials (coarse-remesh with residual errors).
         done_ct = 0
@@ -2081,7 +2073,8 @@ class MainWindow(QMainWindow):
 
     def _on_batch_error(self, msg: str) -> None:
         self._eta_timer.stop()
-        self._current_total = 0
+        self._batch_total = 0
+        self._in_flight.clear()
         self._progress_row.setVisible(False)
         self.source.set_running(False)
         self.advanced.set_running(False)
