@@ -175,7 +175,12 @@ class Dot(QWidget):
 
 
 class Spinner(QWidget):
-    """Ring spinner — rotating 270° arc."""
+    """Ring spinner — rotating 270° arc.
+
+    Only ticks while visible: `FileList` creates one spinner per row, and
+    with hundreds of rows a constantly-running 30ms timer on each one
+    pegs the main thread and freezes the UI mid-batch.
+    """
 
     def __init__(self, size: int = 10, color: str = "#888", parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -185,7 +190,14 @@ class Spinner(QWidget):
         self.setFixedSize(size + 4, size + 4)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def showEvent(self, event):
         self._timer.start(30)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
 
     def set_color(self, color: str) -> None:
         self._color = QColor(color)
