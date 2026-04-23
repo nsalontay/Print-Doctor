@@ -26,6 +26,7 @@ PYI_ARGS=(
     # pymeshfix ships a native _meshfix extension; PyInstaller picks it up via
     # hiddenimports when we add the package.
     --collect-all pymeshfix
+    --collect-all fast_simplification
     --collect-submodules trimesh
 )
 

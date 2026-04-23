@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -50,12 +51,32 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .repair import SUPPORTED_EXTENSIONS, discover_mesh_files
+from .repair import SUPPORTED_EXTENSIONS, discover_mesh_files, fast_face_count
 from .worker import RepairWorker
 
 APP_NAME = "Print Doctor"
 APP_VERSION = f"v{__version__}"
 OUTPUT_SUBDIR = "Repaired"
+LARGE_MESH_THRESHOLD = 1_000_000
+
+
+def _setup_logging() -> None:
+    """Attach a FileHandler to root logger at ~/Library/Logs/Print Doctor/repair.log.
+    Idempotent — safe to call multiple times."""
+    log_dir = os.path.expanduser("~/Library/Logs/Print Doctor")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        return
+    log_path = os.path.join(log_dir, "repair.log")
+    root = logging.getLogger()
+    for h in root.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == log_path:
+            return
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
 
 # (combo_label, display_label, scale_to_meters)
 UNIT_CHOICES = [
@@ -1815,6 +1836,49 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # Run / cancel
     # ------------------------------------------------------------------ #
+    def _prompt_large_mesh_policy(self) -> Optional[bool]:
+        """If any input STL has >LARGE_MESH_THRESHOLD faces, ask the user whether
+        to decimate those meshes before repair. Returns:
+            True  — simplify large meshes
+            False — keep full detail
+            None  — user cancelled; abort the batch
+        Non-STL files are skipped (header probe only supports binary STL)."""
+        oversized = []
+        for p in self.files:
+            if not p.lower().endswith(".stl"):
+                continue
+            n = fast_face_count(p)
+            if n is not None and n > LARGE_MESH_THRESHOLD:
+                oversized.append((os.path.basename(p), n))
+        if not oversized:
+            return False
+
+        preview = "\n".join(f"  • {n}  ({count:,} faces)" for n, count in oversized[:5])
+        more = f"\n  … and {len(oversized) - 5} more" if len(oversized) > 5 else ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(APP_NAME)
+        box.setText(f"{len(oversized)} mesh(es) exceed {LARGE_MESH_THRESHOLD:,} faces.")
+        box.setInformativeText(
+            f"{preview}{more}\n\n"
+            "Repairing meshes this dense can be very slow.\n"
+            "Simplify them first (quadric decimation to ~500k faces)?\n\n"
+            "• Simplify — much faster; loses some surface detail.\n"
+            "• Keep full detail — slow but preserves geometry.\n"
+            "• Cancel — abort the batch."
+        )
+        simplify_btn = box.addButton("Simplify", QMessageBox.AcceptRole)
+        keep_btn = box.addButton("Keep full detail", QMessageBox.RejectRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.DestructiveRole)
+        box.setDefaultButton(simplify_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is simplify_btn:
+            return True
+        if clicked is keep_btn:
+            return False
+        return None
+
     def _start_or_cancel(self) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
@@ -1832,6 +1896,10 @@ class MainWindow(QMainWindow):
         include_unmodified = self.advanced.include_unmodified()
         overwrite = self.advanced.overwrite()
 
+        simplify_large = self._prompt_large_mesh_policy()
+        if simplify_large is None:
+            return
+
         for path in self.files:
             self.file_list.set_status(path, STATUS_PENDING, "queued")
 
@@ -1848,8 +1916,10 @@ class MainWindow(QMainWindow):
         self.worker = RepairWorker(
             self.files, self.output_dir, scale,
             include_unmodified=include_unmodified, overwrite=overwrite,
+            simplify_large=simplify_large,
         )
         self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_phase.connect(self._on_file_phase)
         self.worker.file_finished.connect(self._on_file_finished)
         self.worker.batch_finished.connect(self._on_batch_finished)
         self.worker.batch_error.connect(self._on_batch_error)
@@ -1875,6 +1945,12 @@ class MainWindow(QMainWindow):
         pct = int(100 * (i - 1) / max(1, total))
         self._progress_pct.setText(f"{pct}%")
         self._rail.set_progress(i - 1, total)
+
+    def _on_file_phase(self, i: int, total: int, name: str, phase: str) -> None:
+        path = self._path_for_name(name)
+        if path:
+            label = PHASE_LABELS.get(phase, phase)
+            self.file_list.set_status(path, STATUS_RUNNING, label)
 
     def _on_file_finished(self, result) -> None:
         name = os.path.basename(result.input_path)
@@ -1958,6 +2034,7 @@ def _check_dependencies() -> list[str]:
 
 
 def main() -> int:
+    _setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 
