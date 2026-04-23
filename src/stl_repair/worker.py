@@ -13,12 +13,14 @@ from .repair import RepairResult, is_already_manifold, repair_mesh
 
 class RepairWorker(QThread):
     file_started = Signal(int, int, str)          # (index, total, filename)
+    file_phase = Signal(int, int, str, str)       # (index, total, filename, phase_label)
     file_finished = Signal(object)                # RepairResult
     batch_finished = Signal(int, int, list)       # (success_count, total, failed_filenames)
     batch_error = Signal(str)
 
     def __init__(self, files: list[str], output_dir: str, scale: float,
-                 include_unmodified: bool = False, overwrite: bool = False):
+                 include_unmodified: bool = False, overwrite: bool = False,
+                 simplify_large: bool = False):
         """
         Args:
             files: absolute paths to mesh files to repair.
@@ -26,6 +28,8 @@ class RepairWorker(QThread):
             scale: unit conversion factor applied at import.
             include_unmodified: copy already-manifold files into the output folder.
             overwrite: if False, suffix duplicates ("name (1).obj", "name (2).obj", ...).
+            simplify_large: run quadric decimation on meshes with >1M faces
+                before repair. Much faster; loses some surface detail.
         """
         super().__init__()
         self.files = list(files)
@@ -33,6 +37,7 @@ class RepairWorker(QThread):
         self.scale = scale
         self.include_unmodified = include_unmodified
         self.overwrite = overwrite
+        self.simplify_large = simplify_large
         self._cancel = False
 
     def cancel(self) -> None:
@@ -62,11 +67,13 @@ class RepairWorker(QThread):
 
             success = 0
             failed: list[str] = []
+            total = len(self.files)
             for i, src in enumerate(self.files):
                 if self._cancel:
                     break
                 name = os.path.basename(src)
-                self.file_started.emit(i + 1, len(self.files), name)
+                idx = i + 1
+                self.file_started.emit(idx, total, name)
                 dst = self._resolve_dst(name)
 
                 # Pre-flight: already-manifold files bypass the repair pipeline.
@@ -83,8 +90,20 @@ class RepairWorker(QThread):
                         result = RepairResult(src, dst, True, "clean",
                                               "Already manifold (skipped)")
                 else:
+                    def _on_phase(phase_name: str, _name=name, _idx=idx) -> None:
+                        self.file_phase.emit(_idx, total, _name, phase_name)
+
+                    def _cancelled() -> bool:
+                        return self._cancel
+
                     try:
-                        result = repair_mesh(src, dst, scale=self.scale)
+                        result = repair_mesh(
+                            src, dst,
+                            scale=self.scale,
+                            simplify_large=self.simplify_large,
+                            on_phase=_on_phase,
+                            is_cancelled=_cancelled,
+                        )
                     except Exception as e:
                         result = RepairResult(
                             src, dst, False, "failed",
@@ -97,6 +116,6 @@ class RepairWorker(QThread):
                 else:
                     failed.append(name)
 
-            self.batch_finished.emit(success, len(self.files), failed)
+            self.batch_finished.emit(success, total, failed)
         except Exception as e:
             self.batch_error.emit(f"{e}\n{traceback.format_exc()}")
