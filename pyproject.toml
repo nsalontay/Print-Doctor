@@ -29,6 +29,11 @@ print-doctor = "stl_repair.app:main"
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.5"]
+test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
