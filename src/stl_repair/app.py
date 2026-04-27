@@ -1943,6 +1943,11 @@ class MainWindow(QMainWindow):
         self.worker.file_finished.connect(self._on_file_finished)
         self.worker.batch_finished.connect(self._on_batch_finished)
         self.worker.batch_error.connect(self._on_batch_error)
+        # QThread.finished fires AFTER run() has fully returned, so it's the
+        # only safe place to drop our last Python reference. Nulling
+        # self.worker inside _on_batch_finished would destroy the QThread
+        # while it's still on its own call stack → qFatal.
+        self.worker.finished.connect(self._on_worker_thread_finished)
         self.worker.start()
 
         self.masthead.set_status("running", self._c)
@@ -2063,7 +2068,10 @@ class MainWindow(QMainWindow):
         self.source.set_running(False)
         self.advanced.set_running(False)
         self.dest.set_enabled_state(True)
-        self.worker = None
+        # NB: do NOT null self.worker here — the QThread is still executing
+        # run() while this slot runs (the signal was emitted from inside the
+        # drain loop). Dropping the last ref mid-run() crashes with qFatal.
+        # The reference is cleaned up in _on_worker_thread_finished.
 
         self._done = True
         self.summary.set_counts(done_ct, warn_ct, fail_ct)
@@ -2079,11 +2087,26 @@ class MainWindow(QMainWindow):
         self.source.set_running(False)
         self.advanced.set_running(False)
         self.dest.set_enabled_state(True)
-        self.worker = None
+        # See _on_batch_finished — ref cleanup deferred to
+        # _on_worker_thread_finished to avoid tearing down the QThread
+        # from inside its own run() call.
         self._done = False
         self.masthead.set_status("error", self._c)
         self._update_primary_button()
         QMessageBox.critical(self, APP_NAME, msg)
+
+    def _on_worker_thread_finished(self) -> None:
+        """Drop our last reference to the RepairWorker QThread. Connected to
+        QThread.finished, which Qt guarantees is emitted after run() has
+        fully returned — so destruction here is safe."""
+        worker = self.worker
+        self.worker = None
+        if worker is not None:
+            # deleteLater() schedules C++ destruction for the next event-loop
+            # iteration, after any pending queued signals from this thread
+            # have drained. Belt-and-suspenders — the Python ref drop above
+            # is already safe because finished has fired.
+            worker.deleteLater()
 
 
 def _tildify(path: str) -> str:
