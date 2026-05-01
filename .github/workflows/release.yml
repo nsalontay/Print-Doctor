@@ -1,4 +1,4 @@
-name: Build Print Doctor (macOS)
+name: Build & Release Print Doctor (macOS)
 
 on:
   push:
@@ -17,6 +17,8 @@ jobs:
           - runner: macos-14   # Apple Silicon
             arch: arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      ARTIFACT_NAME: Print-Doctor-macOS-${{ matrix.arch }}.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -29,18 +31,97 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[build]"
 
-      - name: Build .app
+      - name: Build .app via PyInstaller
         run: ./build_macos.sh
 
+      # ---------------------------------------------------------------- #
+      # Code signing + notarization
+      # ---------------------------------------------------------------- #
+      # If the signing secrets aren't configured, skip signing and ship
+      # the unsigned artifact (same as pre-1.0 behavior). For 1.0+ all
+      # secrets must be set or the build fails fast at the sign step.
+      - name: Detect signing readiness
+        id: signing
+        run: |
+          if [[ -n "${{ secrets.APPLE_CERT_P12_BASE64 }}" \
+             && -n "${{ secrets.APPLE_CERT_PASSWORD }}" \
+             && -n "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
+             && -n "${{ secrets.APPLE_ID }}" \
+             && -n "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" \
+             && -n "${{ secrets.APPLE_TEAM_ID }}" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Signing secrets not all set — producing UNSIGNED build."
+          fi
+
+      - name: Import Developer ID certificate into temporary keychain
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          # If KEYCHAIN_PASSWORD secret isn't set, generate a transient one.
+          if [[ -z "$KEYCHAIN_PASSWORD" ]]; then
+            KEYCHAIN_PASSWORD=$(uuidgen)
+          fi
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import /tmp/cert.p12 -k "$KEYCHAIN_PATH" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          # Allow codesign to use the key without prompting.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Add the temp keychain to the search list.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"' | tr -d ' ')
+          rm /tmp/cert.p12
+          # Verify the identity is now usable.
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Stage bundle for signing (strip xattrs)
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          rm -rf "/tmp/Print Doctor.app"
+          ditto --noextattr --noqtn "dist/Print Doctor.app" "/tmp/Print Doctor.app"
+
+      - name: Sign bundle
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: ./scripts/sign_app.sh "/tmp/Print Doctor.app"
+
+      - name: Notarize and staple
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/notarize_app.sh "/tmp/Print Doctor.app"
+
+      - name: Repackage signed+stapled bundle as the release artifact
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          rm -f "dist/Print Doctor.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "/tmp/Print Doctor.app" "dist/Print Doctor.zip"
+
+      # ---------------------------------------------------------------- #
+      # Artifact upload (signed if secrets present, unsigned otherwise)
+      # ---------------------------------------------------------------- #
       - name: Rename artifact with arch
         run: |
           cd dist
-          mv "Print Doctor.zip" "Print-Doctor-macOS-${{ matrix.arch }}.zip"
+          mv "Print Doctor.zip" "${{ env.ARTIFACT_NAME }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: print-doctor-${{ matrix.arch }}
-          path: dist/Print-Doctor-macOS-${{ matrix.arch }}.zip
+          path: dist/${{ env.ARTIFACT_NAME }}
 
   release:
     needs: build

@@ -34,7 +34,16 @@ if [[ -f "$ICON_PATH" ]]; then
     PYI_ARGS+=(--icon "$ICON_PATH")
 fi
 
-pyinstaller "${PYI_ARGS[@]}" "$ENTRY"
+# Prefer the project venv's pyinstaller if present — saves the user from
+# having to `source venv/bin/activate` first. Falls back to PATH for CI,
+# which installs pyinstaller into the runner's system Python.
+if [[ -x "venv/bin/pyinstaller" ]]; then
+    PYI=venv/bin/pyinstaller
+else
+    PYI=pyinstaller
+fi
+
+"$PYI" "${PYI_ARGS[@]}" "$ENTRY"
 
 # Zip the .app for GitHub Release upload
 cd dist

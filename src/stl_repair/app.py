@@ -2107,6 +2107,11 @@ class MainWindow(QMainWindow):
             # have drained. Belt-and-suspenders — the Python ref drop above
             # is already safe because finished has fired.
             worker.deleteLater()
+        # Refresh the primary button now that isRunning() finally returns
+        # False. Without this, _on_batch_finished's call to
+        # _update_primary_button ran while the QThread was still mid-run(),
+        # so the button stayed stuck on "Cancel" with the danger style.
+        self._update_primary_button()
 
 
 def _tildify(path: str) -> str:
