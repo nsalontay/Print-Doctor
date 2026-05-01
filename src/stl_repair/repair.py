@@ -338,7 +338,7 @@ def repair_mesh(input_path: str,
         check_cancel()
 
         # Phase 2 — MeshFix
-        phase("MeshFix")
+        phase("meshfix")
         t0 = time.monotonic()
         fixed = _apply_meshfix(mesh)
         log.info("  Phase 2 (MeshFix) %.2fs", time.monotonic() - t0)
